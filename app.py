@@ -186,7 +186,7 @@ class DnsimpleProcessor:
         name: str,
         existing_records: typing.Dict[str, typing.Any],
         new_record: dns.rdata.Rdata,
-    ) -> None:
+    ) -> bool:
         for record in existing_records[1:]:
             self.logger.info(
                 "deleting extra record %d for zone %d", record["id"], self._zone_id
@@ -211,16 +211,16 @@ class DnsimpleProcessor:
                 old_record["id"],
                 self._zone_id,
             )
-            return
+            return False
 
-        self._create_new_record(name, new_record, old_record.get("id"))
+        return self._create_new_record(name, new_record, old_record.get("id"))
 
     def _create_new_record(
         self,
         name: str,
         new_record: dns.rdata.Rdata,
         old_record_id: int = None,
-    ) -> None:
+    ) -> bool:
         update_method = self.session.post
         url = f"{self.base_url}/zones/{self._zone_id}/records"
         payload = {
@@ -257,7 +257,9 @@ class DnsimpleProcessor:
             )
             raise ValueError("failed to create/update dnsimple record")
 
-    def update_records(self, new_records: typing.List[dns.rdata.Rdata]) -> None:
+        return True
+
+    def update_records(self, new_records: typing.List[dns.rdata.Rdata]) -> bool:
         if self._zone_id is None:
             self._lookup_zone_id()
 
@@ -267,16 +269,20 @@ class DnsimpleProcessor:
             .to_text()
         )
 
+        records_updated = False
         for record in new_records:
             existing_records = self._find_existing_records(
                 record_name, record.rdtype.name
             )
 
-            self._update_or_create_record(
+            updated = self._update_or_create_record(
                 existing_records=existing_records,
                 name=record_name,
                 new_record=record,
             )
+            records_updated = records_updated or updated
+
+        return records_updated
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -296,14 +302,16 @@ def _():
     if processor is None:
         processor = DnsimpleProcessor(domain)
 
-    processor.update_records(records)
+    records_updated = processor.update_records(records)
 
     with CACHE_LOCK:
         if domain not in CACHE:
             CACHE[domain] = processor
             app.logger.info("added %s to processor cache", domain)
 
-    return "OK"
+    ip = records[0].to_text()  # _validate() ensures there's at least 1 ip provided
+    # See https://support.google.com/domains/answer/6147083 for responses
+    return f"good {ip}" if records_updated else f"nochg {ip}"
 
 
 if __name__ == "__main__":
