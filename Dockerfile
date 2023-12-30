@@ -1,8 +1,7 @@
-FROM alpine
+FROM docker.io/library/python:3-alpine
 
-RUN apk add python3 \
-    && python3 -m ensurepip \
-    && pip3 install -U pip setuptools wheel
+RUN pip3 install -U pip setuptools wheel \
+    && apk add gcc musl-dev
 
 COPY requirements.txt /tmp/requirements.txt
 RUN pip3 install -r /tmp/requirements.txt
