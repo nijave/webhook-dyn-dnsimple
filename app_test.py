@@ -63,7 +63,10 @@ class WebhookTests(unittest.TestCase):
         )
 
     @staticmethod
-    def _stub_records_response(record_type: str):
+    def _stub_records_response(
+        record_type: str,
+        record_count: int = 1,
+    ):
         assert record_type in (None, "A", "AAAA")
         content = TEST_IP4 if record_type == "A" else TEST_IP6
 
@@ -84,7 +87,7 @@ class WebhookTests(unittest.TestCase):
                     "created_at": "2016-03-22T10:20:53Z",
                     "updated_at": "2016-10-05T09:26:38Z",
                 },
-            ]
+            ] * record_count
 
         return responses.add(
             method="GET",
@@ -96,7 +99,7 @@ class WebhookTests(unittest.TestCase):
                 "pagination": {
                     "current_page": 1,
                     "per_page": 30,
-                    "total_entries": 1,
+                    "total_entries": record_count,
                     "total_pages": 1,
                 },
             },
@@ -147,6 +150,19 @@ class WebhookTests(unittest.TestCase):
             callback=response_handler,
         )
 
+    @staticmethod
+    def _stub_record_delete():
+        return responses.add(
+            method="DELETE",
+            url=re.compile(
+                "https://api.dnsimple.com"
+                f"/v2/{os.environ['DNSIMPLE_ACCOUNT_ID']}"
+                f"/zones/{DNSIMPLE_ZONE_ID}"
+                "/records/[0-9]+"
+            ),
+            status=204,
+        )
+
     @responses.activate
     def test_bad_auth(self):
         response = flask_app.test_client().get(
@@ -170,10 +186,13 @@ class WebhookTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         self.assertEqual(f"nochg {TEST_IP4}", response.text)
 
-    @responses.activate
-    def test_change(self):
+    @responses.activate(assert_all_requests_are_fired=True)
+    def test_change(
+        self,
+        existing_record_count: int = 1,
+    ):
         self._stub_zone_response()
-        self._stub_records_response("A")
+        self._stub_records_response("A", record_count=existing_record_count)
 
         new_ip = "127.0.0.2"
         assert new_ip != TEST_IP4
@@ -219,35 +238,50 @@ class WebhookTests(unittest.TestCase):
 
         self.assertEqual(ttl, request_body["ttl"])
 
+    def test_delete_extra_records(self):
+        self._stub_record_delete()
+
+        # assert_all_requests_are_fired=True on test_change will cause a failure if
+        # the delete stub wasn't called
+        self.test_change(
+            existing_record_count=2,
+        )
+
     @responses.activate
-    def test_new_record(self):
+    def test_new_record(
+        self, record_type: str = "A", param_name: str = "myip", content: str = TEST_IP4
+    ):
         self._stub_zone_response()
         self._stub_records_response(None)
 
-        self._stub_record_update("POST", TEST_IP4)
+        self._stub_record_update("POST", content)
 
         response = flask_app.test_client().get(
             "/",
-            query_string=IP4_DATA,
+            query_string={
+                "hostname": TEST_DOMAIN,
+                param_name: content,
+            },
             headers=AUTH_HEADER,
         )
 
         self.assertEqual(200, response.status_code)
-        self.assertEqual(f"good {TEST_IP4}", response.text)
+        self.assertEqual(f"good {content}", response.text)
         update_call = [
             call for call in responses.calls if call.request.method == "POST"
         ]
         self.assertEqual(1, len(update_call))
         request_body = json.loads(update_call[0].request.body.decode("utf8"))
 
-        self.assertEqual("A", request_body["type"])
-        self.assertEqual(TEST_IP4, request_body["content"])
+        self.assertEqual(record_type, request_body["type"])
+        self.assertEqual(content, request_body["content"])
 
     def test_new_record_ipv6(self):
-        """TODO"""
-
-    def test_delete_extra_records(self):
-        """TODO test deleting extra records if more than 1 already exist"""
+        self.test_new_record(
+            record_type="AAAA",
+            param_name="myipv6",
+            content=TEST_IP6,
+        )
 
     def test_zone_dns_lookup_errors(self):
         """TODO test error handling if SOA queries fail"""
