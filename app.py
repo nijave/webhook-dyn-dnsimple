@@ -15,7 +15,7 @@ AUTHENTICATION_MAP = json.loads(os.environ["AUTHENTICATION"])
 DNSIMPLE_ACCOUNT_ID = os.environ["DNSIMPLE_ACCOUNT_ID"]
 DNSIMPLE_API_KEY = os.environ["DNSIMPLE_API_KEY"]
 
-DEFAULT_RECORD_TTL = 60
+DEFAULT_RECORD_TTL = int(os.environ.get("DNS_TTL", "60"))
 
 """
 Reduce requests to dnsimple and dns lookups
