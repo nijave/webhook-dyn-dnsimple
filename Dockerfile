@@ -1,7 +1,7 @@
 FROM docker.io/library/python:3-alpine
 
 RUN pip3 install -U pip setuptools wheel \
-    && apk add gcc musl-dev
+    && apk add gcc musl-dev git
 
 COPY requirements.txt /tmp/requirements.txt
 RUN pip3 install -r /tmp/requirements.txt
