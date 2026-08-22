@@ -2,6 +2,7 @@ import base64
 import random
 import re
 import unittest
+import urllib.parse
 
 import responses
 import os
@@ -63,6 +64,23 @@ class WebhookTests(unittest.TestCase):
         )
 
     @staticmethod
+    def _record_dict(record_id: int, content: str, record_type: str):
+        return {
+            "id": record_id,
+            "zone_id": TEST_DOMAIN,
+            "parent_id": None,
+            "name": "",
+            "content": content,
+            "ttl": 3600,
+            "priority": None,
+            "type": record_type,
+            "regions": ["global"],
+            "system_record": False,
+            "created_at": "2016-03-22T10:20:53Z",
+            "updated_at": "2016-10-05T09:26:38Z",
+        }
+
+    @staticmethod
     def _stub_records_response(
         record_type: str,
         record_count: int = 1,
@@ -73,20 +91,7 @@ class WebhookTests(unittest.TestCase):
         data = []
         if record_type:
             data = [
-                {
-                    "id": DNSIMPLE_RECORD_ID,
-                    "zone_id": TEST_DOMAIN,
-                    "parent_id": None,
-                    "name": "",
-                    "content": content,
-                    "ttl": 3600,
-                    "priority": None,
-                    "type": record_type,
-                    "regions": ["global"],
-                    "system_record": False,
-                    "created_at": "2016-03-22T10:20:53Z",
-                    "updated_at": "2016-10-05T09:26:38Z",
-                },
+                WebhookTests._record_dict(DNSIMPLE_RECORD_ID, content, record_type)
             ] * record_count
 
         return responses.add(
@@ -103,6 +108,41 @@ class WebhookTests(unittest.TestCase):
                     "total_pages": 1,
                 },
             },
+        )
+
+    @staticmethod
+    def _stub_paginated_records_response(record_type: str, pages):
+        """Stub a zone record listing spread across multiple pages.
+
+        pages is a list where each element is the list of records on that page.
+        """
+        assert record_type in ("A", "AAAA")
+
+        def callback(request):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(request.url).query)
+            page = int(query.get("page", ["1"])[0])
+            return (
+                200,
+                {},
+                json.dumps(
+                    {
+                        "data": pages[page - 1],
+                        "pagination": {
+                            "current_page": page,
+                            "per_page": len(pages[page - 1]),
+                            "total_entries": sum(len(p) for p in pages),
+                            "total_pages": len(pages),
+                        },
+                    }
+                ),
+            )
+
+        return responses.add_callback(
+            method="GET",
+            url=re.compile(
+                f"https://api\\.dnsimple\\.com/v2/{os.environ['DNSIMPLE_ACCOUNT_ID']}/zones/{DNSIMPLE_ZONE_ID}/records\\?.*"
+            ),
+            callback=callback,
         )
 
     @staticmethod
@@ -246,6 +286,40 @@ class WebhookTests(unittest.TestCase):
         self.test_change(
             existing_record_count=2,
         )
+
+    @responses.activate
+    def test_existing_records_pagination(self):
+        """existing record lookup follows pagination and updates all found records"""
+        page_one_record = WebhookTests._record_dict(1, "127.0.0.2", "A")
+        page_two_record = WebhookTests._record_dict(2, "127.0.0.3", "A")
+        self._stub_zone_response()
+        self._stub_paginated_records_response(
+            "A", [[page_one_record], [page_two_record]]
+        )
+        self._stub_record_update("PATCH", TEST_IP4)
+        self._stub_record_delete()
+
+        response = flask_app.test_client().get(
+            "/",
+            query_string=IP4_DATA,
+            headers=AUTH_HEADER,
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(f"good {TEST_IP4}", response.text)
+
+        update_calls = [
+            call for call in responses.calls if call.request.method == "PATCH"
+        ]
+        self.assertEqual(1, len(update_calls))
+        request_body = json.loads(update_calls[0].request.body.decode("utf8"))
+        self.assertEqual(TEST_IP4, request_body["content"])
+
+        delete_calls = [
+            call for call in responses.calls if call.request.method == "DELETE"
+        ]
+        self.assertEqual(1, len(delete_calls))
+        self.assertTrue(delete_calls[0].request.url.endswith("/records/2"))
 
     @responses.activate
     def test_new_record(
