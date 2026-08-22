@@ -1,9 +1,12 @@
 import base64
 import random
 import re
+import time
 import unittest
 import urllib.parse
+from unittest import mock
 
+import dns.resolver
 import responses
 import os
 import json
@@ -380,5 +383,29 @@ class WebhookTests(unittest.TestCase):
         )
         self.assertEqual(400, response.status_code)
 
-    def test_zone_dns_lookup_errors(self):
-        """TODO test error handling if SOA queries fail"""
+    def test_zone_dns_lookup_parent_walk(self):
+        """unresolvable soa records walk up to the registered parent zone"""
+        for error in (
+            dns.resolver.NXDOMAIN,
+            dns.resolver.NoAnswer,
+            dns.resolver.NoNameservers,
+        ):
+            with self.subTest(error=error):
+                with mock.patch.object(dns.resolver, "resolve", side_effect=error):
+                    processor = app.DnsimpleProcessor(TEST_DOMAIN)
+
+                self.assertEqual("com", processor._zone_name)
+
+    def test_zone_dns_lookup_timeout(self):
+        """repeated soa lookup timeouts eventually raise"""
+        # let the initial zone lookup succeed so we can call _find_zone directly
+        with mock.patch.object(dns.resolver, "resolve"):
+            processor = app.DnsimpleProcessor(TEST_DOMAIN)
+
+        with mock.patch.object(
+            dns.resolver, "resolve", side_effect=dns.resolver.LifetimeTimeout
+        ):
+            start = time.monotonic()
+            with self.assertRaises(AttributeError):
+                processor._find_zone(TEST_DOMAIN, max_time=0.5)
+            self.assertGreater(time.monotonic() - start, 0.25)
