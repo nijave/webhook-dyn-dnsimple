@@ -56,12 +56,22 @@ def _validate() -> (str, typing.List[dns.rdata.Rdata]):
     has_hostname = "hostname" in request.args
 
     ips = []
-    # TODO fix shouldn't allow ipv4 in myipv6 and ipv6 in myip
     for ip_type in ("myip", "myipv6"):
         ip_value = request.args.get(ip_type)
         if not ip_value:
             continue
-        ips.append(ipaddress.ip_address(ip_value))
+        ip_addr = ipaddress.ip_address(ip_value)
+        expected_version = 4 if ip_type == "myip" else 6
+        if ip_addr.version != expected_version:
+            app.logger.warning(
+                "ip %s in %s is ipv%d, expected ipv%d",
+                ip_value,
+                ip_type,
+                ip_addr.version,
+                expected_version,
+            )
+            abort(400)
+        ips.append(ip_addr)
     has_ip = len(ips) > 0
 
     if not (has_hostname and has_ip):
@@ -165,21 +175,27 @@ class DnsimpleProcessor:
     def _find_existing_records(
         self, record_name: str, record_type: str
     ) -> typing.List[typing.Dict[str, typing.Any]]:
-        # TODO this doesn't handle pagination but there should only be up to 2 records...
-        response = self.session.get(
-            f"{self.base_url}/zones/{self._zone_id}/records",
-            params={
-                "name": record_name,
-                "type": record_type,
-            },
-        )
-        total_pages = response.json()["pagination"]["total_pages"]
-        if total_pages != 1:
-            self.logger.warning(
-                "found %d pages of dns records. results are unpredictable", total_pages
+        records = []
+        page = 1
+        while True:
+            response = self.session.get(
+                f"{self.base_url}/zones/{self._zone_id}/records",
+                params={
+                    "name": record_name,
+                    "type": record_type,
+                    "per_page": 100,
+                    "page": page,
+                },
             )
+            body = response.json()
+            records.extend(body["data"])
 
-        return response.json()["data"]
+            if body["pagination"]["total_pages"] > page:
+                page += 1
+            else:
+                break
+
+        return records
 
     def _update_or_create_record(
         self,

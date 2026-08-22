@@ -1,8 +1,12 @@
 import base64
 import random
 import re
+import time
 import unittest
+import urllib.parse
+from unittest import mock
 
+import dns.resolver
 import responses
 import os
 import json
@@ -63,6 +67,23 @@ class WebhookTests(unittest.TestCase):
         )
 
     @staticmethod
+    def _record_dict(record_id: int, content: str, record_type: str):
+        return {
+            "id": record_id,
+            "zone_id": TEST_DOMAIN,
+            "parent_id": None,
+            "name": "",
+            "content": content,
+            "ttl": 3600,
+            "priority": None,
+            "type": record_type,
+            "regions": ["global"],
+            "system_record": False,
+            "created_at": "2016-03-22T10:20:53Z",
+            "updated_at": "2016-10-05T09:26:38Z",
+        }
+
+    @staticmethod
     def _stub_records_response(
         record_type: str,
         record_count: int = 1,
@@ -73,20 +94,7 @@ class WebhookTests(unittest.TestCase):
         data = []
         if record_type:
             data = [
-                {
-                    "id": DNSIMPLE_RECORD_ID,
-                    "zone_id": TEST_DOMAIN,
-                    "parent_id": None,
-                    "name": "",
-                    "content": content,
-                    "ttl": 3600,
-                    "priority": None,
-                    "type": record_type,
-                    "regions": ["global"],
-                    "system_record": False,
-                    "created_at": "2016-03-22T10:20:53Z",
-                    "updated_at": "2016-10-05T09:26:38Z",
-                },
+                WebhookTests._record_dict(DNSIMPLE_RECORD_ID, content, record_type)
             ] * record_count
 
         return responses.add(
@@ -103,6 +111,41 @@ class WebhookTests(unittest.TestCase):
                     "total_pages": 1,
                 },
             },
+        )
+
+    @staticmethod
+    def _stub_paginated_records_response(record_type: str, pages):
+        """Stub a zone record listing spread across multiple pages.
+
+        pages is a list where each element is the list of records on that page.
+        """
+        assert record_type in ("A", "AAAA")
+
+        def callback(request):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(request.url).query)
+            page = int(query.get("page", ["1"])[0])
+            return (
+                200,
+                {},
+                json.dumps(
+                    {
+                        "data": pages[page - 1],
+                        "pagination": {
+                            "current_page": page,
+                            "per_page": len(pages[page - 1]),
+                            "total_entries": sum(len(p) for p in pages),
+                            "total_pages": len(pages),
+                        },
+                    }
+                ),
+            )
+
+        return responses.add_callback(
+            method="GET",
+            url=re.compile(
+                f"https://api\\.dnsimple\\.com/v2/{os.environ['DNSIMPLE_ACCOUNT_ID']}/zones/{DNSIMPLE_ZONE_ID}/records\\?.*"
+            ),
+            callback=callback,
         )
 
     @staticmethod
@@ -248,6 +291,40 @@ class WebhookTests(unittest.TestCase):
         )
 
     @responses.activate
+    def test_existing_records_pagination(self):
+        """existing record lookup follows pagination and updates all found records"""
+        page_one_record = WebhookTests._record_dict(1, "127.0.0.2", "A")
+        page_two_record = WebhookTests._record_dict(2, "127.0.0.3", "A")
+        self._stub_zone_response()
+        self._stub_paginated_records_response(
+            "A", [[page_one_record], [page_two_record]]
+        )
+        self._stub_record_update("PATCH", TEST_IP4)
+        self._stub_record_delete()
+
+        response = flask_app.test_client().get(
+            "/",
+            query_string=IP4_DATA,
+            headers=AUTH_HEADER,
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(f"good {TEST_IP4}", response.text)
+
+        update_calls = [
+            call for call in responses.calls if call.request.method == "PATCH"
+        ]
+        self.assertEqual(1, len(update_calls))
+        request_body = json.loads(update_calls[0].request.body.decode("utf8"))
+        self.assertEqual(TEST_IP4, request_body["content"])
+
+        delete_calls = [
+            call for call in responses.calls if call.request.method == "DELETE"
+        ]
+        self.assertEqual(1, len(delete_calls))
+        self.assertTrue(delete_calls[0].request.url.endswith("/records/2"))
+
+    @responses.activate
     def test_new_record(
         self, record_type: str = "A", param_name: str = "myip", content: str = TEST_IP4
     ):
@@ -283,5 +360,52 @@ class WebhookTests(unittest.TestCase):
             content=TEST_IP6,
         )
 
-    def test_zone_dns_lookup_errors(self):
-        """TODO test error handling if SOA queries fail"""
+    @responses.activate
+    def test_rejects_wrong_ip_version(self):
+        self._stub_zone_response()
+        self._stub_records_response("A")
+        self._stub_record_update("PATCH", TEST_IP4)
+        self._stub_record_update("POST", TEST_IP4)
+
+        # ipv4 address in myipv6
+        response = flask_app.test_client().get(
+            "/",
+            query_string={"hostname": TEST_DOMAIN, "myipv6": TEST_IP4},
+            headers=AUTH_HEADER,
+        )
+        self.assertEqual(400, response.status_code)
+
+        # ipv6 address in myip
+        response = flask_app.test_client().get(
+            "/",
+            query_string={"hostname": TEST_DOMAIN, "myip": TEST_IP6},
+            headers=AUTH_HEADER,
+        )
+        self.assertEqual(400, response.status_code)
+
+    def test_zone_dns_lookup_parent_walk(self):
+        """unresolvable soa records walk up to the registered parent zone"""
+        for error in (
+            dns.resolver.NXDOMAIN,
+            dns.resolver.NoAnswer,
+            dns.resolver.NoNameservers,
+        ):
+            with self.subTest(error=error):
+                with mock.patch.object(dns.resolver, "resolve", side_effect=error):
+                    processor = app.DnsimpleProcessor(TEST_DOMAIN)
+
+                self.assertEqual("com", processor._zone_name)
+
+    def test_zone_dns_lookup_timeout(self):
+        """repeated soa lookup timeouts eventually raise"""
+        # let the initial zone lookup succeed so we can call _find_zone directly
+        with mock.patch.object(dns.resolver, "resolve"):
+            processor = app.DnsimpleProcessor(TEST_DOMAIN)
+
+        with mock.patch.object(
+            dns.resolver, "resolve", side_effect=dns.resolver.LifetimeTimeout
+        ):
+            start = time.monotonic()
+            with self.assertRaises(AttributeError):
+                processor._find_zone(TEST_DOMAIN, max_time=0.5)
+            self.assertGreater(time.monotonic() - start, 0.25)
