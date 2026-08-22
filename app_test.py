@@ -283,5 +283,28 @@ class WebhookTests(unittest.TestCase):
             content=TEST_IP6,
         )
 
+    @responses.activate
+    def test_rejects_wrong_ip_version(self):
+        self._stub_zone_response()
+        self._stub_records_response("A")
+        self._stub_record_update("PATCH", TEST_IP4)
+        self._stub_record_update("POST", TEST_IP4)
+
+        # ipv4 address in myipv6
+        response = flask_app.test_client().get(
+            "/",
+            query_string={"hostname": TEST_DOMAIN, "myipv6": TEST_IP4},
+            headers=AUTH_HEADER,
+        )
+        self.assertEqual(400, response.status_code)
+
+        # ipv6 address in myip
+        response = flask_app.test_client().get(
+            "/",
+            query_string={"hostname": TEST_DOMAIN, "myip": TEST_IP6},
+            headers=AUTH_HEADER,
+        )
+        self.assertEqual(400, response.status_code)
+
     def test_zone_dns_lookup_errors(self):
         """TODO test error handling if SOA queries fail"""

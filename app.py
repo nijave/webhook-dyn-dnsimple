@@ -56,12 +56,22 @@ def _validate() -> (str, typing.List[dns.rdata.Rdata]):
     has_hostname = "hostname" in request.args
 
     ips = []
-    # TODO fix shouldn't allow ipv4 in myipv6 and ipv6 in myip
     for ip_type in ("myip", "myipv6"):
         ip_value = request.args.get(ip_type)
         if not ip_value:
             continue
-        ips.append(ipaddress.ip_address(ip_value))
+        ip_addr = ipaddress.ip_address(ip_value)
+        expected_version = 4 if ip_type == "myip" else 6
+        if ip_addr.version != expected_version:
+            app.logger.warning(
+                "ip %s in %s is ipv%d, expected ipv%d",
+                ip_value,
+                ip_type,
+                ip_addr.version,
+                expected_version,
+            )
+            abort(400)
+        ips.append(ip_addr)
     has_ip = len(ips) > 0
 
     if not (has_hostname and has_ip):
